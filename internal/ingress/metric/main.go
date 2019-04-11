@@ -22,6 +22,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"k8s.io/apimachinery/pkg/util/sets"
+
 	"k8s.io/ingress-nginx/internal/ingress"
 	"k8s.io/ingress-nginx/internal/ingress/annotations/class"
 	"k8s.io/ingress-nginx/internal/ingress/metric/collectors"
@@ -34,9 +36,15 @@ type Collector interface {
 	IncReloadCount()
 	IncReloadErrorCount()
 
+	OnStartedLeading(string)
+	OnStoppedLeading(string)
+
 	RemoveMetrics(ingresses, endpoints []string)
 
 	SetSSLExpireTime([]*ingress.Server)
+
+	// SetHosts sets the hostnames that are being served by the ingress controller
+	SetHosts(sets.String)
 
 	Start()
 	Stop()
@@ -54,7 +62,7 @@ type collector struct {
 }
 
 // NewCollector creates a new metric collector the for ingress controller
-func NewCollector(statusPort int, registry *prometheus.Registry) (Collector, error) {
+func NewCollector(metricsPerHost bool, registry *prometheus.Registry) (Collector, error) {
 	podNamespace := os.Getenv("POD_NAMESPACE")
 	if podNamespace == "" {
 		podNamespace = "default"
@@ -62,7 +70,7 @@ func NewCollector(statusPort int, registry *prometheus.Registry) (Collector, err
 
 	podName := os.Getenv("POD_NAME")
 
-	nc, err := collectors.NewNGINXStatus(podName, podNamespace, class.IngressClass, statusPort)
+	nc, err := collectors.NewNGINXStatus(podName, podNamespace, class.IngressClass)
 	if err != nil {
 		return nil, err
 	}
@@ -72,7 +80,7 @@ func NewCollector(statusPort int, registry *prometheus.Registry) (Collector, err
 		return nil, err
 	}
 
-	s, err := collectors.NewSocketCollector(podName, podNamespace, class.IngressClass)
+	s, err := collectors.NewSocketCollector(podName, podNamespace, class.IngressClass, metricsPerHost)
 	if err != nil {
 		return nil, err
 	}
@@ -137,4 +145,19 @@ func (c *collector) Stop() {
 
 func (c *collector) SetSSLExpireTime(servers []*ingress.Server) {
 	c.ingressController.SetSSLExpireTime(servers)
+}
+
+func (c *collector) SetHosts(hosts sets.String) {
+	c.socket.SetHosts(hosts)
+}
+
+// OnStartedLeading indicates the pod was elected as the leader
+func (c *collector) OnStartedLeading(electionID string) {
+	c.ingressController.OnStartedLeading(electionID)
+}
+
+// OnStoppedLeading indicates the pod stopped being the leader
+func (c *collector) OnStoppedLeading(electionID string) {
+	c.ingressController.OnStoppedLeading(electionID)
+	c.ingressController.RemoveAllSSLExpireMetrics(c.registry)
 }

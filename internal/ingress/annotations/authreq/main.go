@@ -21,11 +21,14 @@ import (
 	"regexp"
 	"strings"
 
+	"k8s.io/klog"
+
 	extensions "k8s.io/api/extensions/v1beta1"
 
 	"k8s.io/ingress-nginx/internal/ingress/annotations/parser"
 	ing_errors "k8s.io/ingress-nginx/internal/ingress/errors"
 	"k8s.io/ingress-nginx/internal/ingress/resolver"
+	"k8s.io/ingress-nginx/internal/sets"
 )
 
 // Config returns external authentication configuration for an Ingress rule
@@ -37,6 +40,7 @@ type Config struct {
 	Method          string   `json:"method"`
 	ResponseHeaders []string `json:"responseHeaders,omitempty"`
 	RequestRedirect string   `json:"requestRedirect"`
+	AuthSnippet     string   `json:"authSnippet"`
 }
 
 // Equal tests for equality between two Config types
@@ -59,19 +63,16 @@ func (e1 *Config) Equal(e2 *Config) bool {
 	if e1.Method != e2.Method {
 		return false
 	}
-	for _, ep1 := range e1.ResponseHeaders {
-		found := false
-		for _, ep2 := range e2.ResponseHeaders {
-			if ep1 == ep2 {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return false
-		}
+
+	match := sets.StringElementsMatch(e1.ResponseHeaders, e2.ResponseHeaders)
+	if !match {
+		return false
 	}
+
 	if e1.RequestRedirect != e2.RequestRedirect {
+		return false
+	}
+	if e1.AuthSnippet != e2.AuthSnippet {
 		return false
 	}
 
@@ -117,9 +118,6 @@ func (a authReq) Parse(ing *extensions.Ingress) (interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	if urlString == "" {
-		return nil, ing_errors.NewLocationDenied("an empty string is not a valid URL")
-	}
 
 	authURL, err := url.Parse(urlString)
 	if err != nil {
@@ -141,7 +139,15 @@ func (a authReq) Parse(ing *extensions.Ingress) (interface{}, error) {
 	}
 
 	// Optional Parameters
-	signIn, _ := parser.GetStringAnnotation("auth-signin", ing)
+	signIn, err := parser.GetStringAnnotation("auth-signin", ing)
+	if err != nil {
+		klog.V(3).Infof("auth-signin annotation is undefined and will not be set")
+	}
+
+	authSnippet, err := parser.GetStringAnnotation("auth-snippet", ing)
+	if err != nil {
+		klog.V(3).Infof("auth-snippet annotation is undefined and will not be set")
+	}
 
 	responseHeaders := []string{}
 	hstr, _ := parser.GetStringAnnotation("auth-response-headers", ing)
@@ -167,5 +173,6 @@ func (a authReq) Parse(ing *extensions.Ingress) (interface{}, error) {
 		Method:          authMethod,
 		ResponseHeaders: responseHeaders,
 		RequestRedirect: requestRedirect,
+		AuthSnippet:     authSnippet,
 	}, nil
 }

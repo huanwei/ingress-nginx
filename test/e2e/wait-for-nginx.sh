@@ -15,6 +15,7 @@
 # limitations under the License.
 
 set -e
+set -x
 
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
@@ -28,12 +29,14 @@ function on_exit {
     test $error_code == 0 && return;
 
     echo "Obtaining ingress controller pod logs..."
-    kubectl logs -l app=ingress-nginx -n $NAMESPACE
+    kubectl logs -l app.kubernetes.io/name=ingress-nginx -n $NAMESPACE
 }
 trap on_exit EXIT
 
-sed "s@\${NAMESPACE}@${NAMESPACE}@" $DIR/../manifests/ingress-controller/mandatory.yaml | kubectl apply --namespace=$NAMESPACE -f -
-cat $DIR/../manifests/ingress-controller/service-nodeport.yaml | kubectl apply --namespace=$NAMESPACE -f -
+kubectl apply --namespace=$NAMESPACE -f $DIR/manifests/service.yaml
+
+sed "s@\${NAMESPACE}@${NAMESPACE}@" $DIR/manifests/mandatory.yaml | kubectl apply --namespace=$NAMESPACE -f -
+cat $DIR/manifests/service.yaml | kubectl apply --namespace=$NAMESPACE -f -
 
 # wait for the deployment and fail if there is an error before starting the execution of any test
 kubectl rollout status \
