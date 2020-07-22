@@ -1,37 +1,58 @@
 local ngx_balancer = require("ngx.balancer")
 local cjson = require("cjson.safe")
 local util = require("util")
-local dns_util = require("util.dns")
+local dns_lookup = require("util.dns").lookup
 local configuration = require("configuration")
 local round_robin = require("balancer.round_robin")
 local chash = require("balancer.chash")
 local chashsubset = require("balancer.chashsubset")
-local sticky = require("balancer.sticky")
+local sticky_balanced = require("balancer.sticky_balanced")
+local sticky_persistent = require("balancer.sticky_persistent")
 local ewma = require("balancer.ewma")
+local string = string
+local ipairs = ipairs
+local table = table
+local getmetatable = getmetatable
+local tostring = tostring
+local pairs = pairs
+local math = math
+local ngx = ngx
 
 -- measured in seconds
 -- for an Nginx worker to pick up the new list of upstream peers
--- it will take <the delay until controller POSTed the backend object to the Nginx endpoint> + BACKENDS_SYNC_INTERVAL
+-- it will take <the delay until controller POSTed the backend object to the
+-- Nginx endpoint> + BACKENDS_SYNC_INTERVAL
 local BACKENDS_SYNC_INTERVAL = 1
+local BACKENDS_FORCE_SYNC_INTERVAL = 30
 
 local DEFAULT_LB_ALG = "round_robin"
 local IMPLEMENTATIONS = {
   round_robin = round_robin,
   chash = chash,
   chashsubset = chashsubset,
-  sticky = sticky,
+  sticky_balanced = sticky_balanced,
+  sticky_persistent = sticky_persistent,
   ewma = ewma,
 }
 
 local _M = {}
 local balancers = {}
+local backends_with_external_name = {}
+local backends_last_synced_at = 0
 
 local function get_implementation(backend)
   local name = backend["load-balance"] or DEFAULT_LB_ALG
 
-  if backend["sessionAffinityConfig"] and backend["sessionAffinityConfig"]["name"] == "cookie" then
-    name = "sticky"
-  elseif backend["upstreamHashByConfig"] and backend["upstreamHashByConfig"]["upstream-hash-by"] then
+  if backend["sessionAffinityConfig"] and
+     backend["sessionAffinityConfig"]["name"] == "cookie" then
+    if backend["sessionAffinityConfig"]["mode"] == 'persistent' then
+      name = "sticky_persistent"
+    else
+      name = "sticky_balanced"
+    end
+
+  elseif backend["upstreamHashByConfig"] and
+         backend["upstreamHashByConfig"]["upstream-hash-by"] then
     if backend["upstreamHashByConfig"]["upstream-hash-by-subset"] then
       name = "chashsubset"
     else
@@ -41,7 +62,8 @@ local function get_implementation(backend)
 
   local implementation = IMPLEMENTATIONS[name]
   if not implementation then
-    ngx.log(ngx.WARN, string.format("%s is not supported, falling back to %s", backend["load-balance"], DEFAULT_LB_ALG))
+    ngx.log(ngx.WARN, backend["load-balance"], "is not supported, ",
+            "falling back to ", DEFAULT_LB_ALG)
     implementation = IMPLEMENTATIONS[DEFAULT_LB_ALG]
   end
 
@@ -52,7 +74,7 @@ local function resolve_external_names(original_backend)
   local backend = util.deepcopy(original_backend)
   local endpoints = {}
   for _, endpoint in ipairs(backend.endpoints) do
-    local ips = dns_util.resolve(endpoint.address)
+    local ips = dns_lookup(endpoint.address)
     for _, ip in ipairs(ips) do
       table.insert(endpoints, { address = ip, port = endpoint.port })
     end
@@ -73,9 +95,14 @@ local function format_ipv6_endpoints(endpoints)
   return formatted_endpoints
 end
 
+local function is_backend_with_external_name(backend)
+  local serv_type = backend.service and backend.service.spec
+                      and backend.service.spec["type"]
+  return serv_type == "ExternalName"
+end
+
 local function sync_backend(backend)
   if not backend.endpoints or #backend.endpoints == 0 then
-    ngx.log(ngx.INFO, string.format("there is no endpoint for backend %s. Removing...", backend.name))
     balancers[backend.name] = nil
     return
   end
@@ -93,13 +120,13 @@ local function sync_backend(backend)
   -- if it is not then we deduce LB algorithm has changed for the backend
   if getmetatable(balancer) ~= implementation then
     ngx.log(ngx.INFO,
-      string.format("LB algorithm changed from %s to %s, resetting the instance", balancer.name, implementation.name))
+        string.format("LB algorithm changed from %s to %s, resetting the instance",
+                      balancer.name, implementation.name))
     balancers[backend.name] = implementation:new(backend)
     return
   end
 
-  local service_type = backend.service and backend.service.spec and backend.service.spec["type"]
-  if service_type == "ExternalName" then
+  if is_backend_with_external_name(backend) then
     backend = resolve_external_names(backend)
   end
 
@@ -109,6 +136,17 @@ local function sync_backend(backend)
 end
 
 local function sync_backends()
+  local raw_backends_last_synced_at = configuration.get_raw_backends_last_synced_at()
+  ngx.update_time()
+  local current_timestamp = ngx.time()
+  if current_timestamp - backends_last_synced_at < BACKENDS_FORCE_SYNC_INTERVAL
+      and raw_backends_last_synced_at <= backends_last_synced_at then
+    for _, backend_with_external_name in pairs(backends_with_external_name) do
+      sync_backend(backend_with_external_name)
+    end
+    return
+  end
+
   local backends_data = configuration.get_backends_data()
   if not backends_data then
     balancers = {}
@@ -125,13 +163,19 @@ local function sync_backends()
   for _, new_backend in ipairs(new_backends) do
     sync_backend(new_backend)
     balancers_to_keep[new_backend.name] = balancers[new_backend.name]
+    if is_backend_with_external_name(new_backend) then
+      local backend_with_external_name = util.deepcopy(new_backend)
+      backends_with_external_name[backend_with_external_name.name] = backend_with_external_name
+    end
   end
 
   for backend_name, _ in pairs(balancers) do
     if not balancers_to_keep[backend_name] then
       balancers[backend_name] = nil
+      backends_with_external_name[backend_name] = nil
     end
   end
+  backends_last_synced_at = raw_backends_last_synced_at
 end
 
 local function route_to_alternative_balancer(balancer)
@@ -148,22 +192,36 @@ local function route_to_alternative_balancer(balancer)
 
   local alternative_balancer = balancers[backend_name]
   if not alternative_balancer then
-    ngx.log(ngx.ERR, "no alternative balancer for backend: " .. tostring(backend_name))
+    ngx.log(ngx.ERR, "no alternative balancer for backend: ",
+            tostring(backend_name))
     return false
   end
 
   local traffic_shaping_policy =  alternative_balancer.traffic_shaping_policy
   if not traffic_shaping_policy then
-    ngx.log(ngx.ERR, "traffic shaping policy is not set for balanacer of backend: " .. tostring(backend_name))
+    ngx.log(ngx.ERR, "traffic shaping policy is not set for balanacer ",
+            "of backend: ", tostring(backend_name))
     return false
   end
 
-  local target_header = util.replace_special_char(traffic_shaping_policy.header, "-", "_")
+  local target_header = util.replace_special_char(traffic_shaping_policy.header,
+                                                  "-", "_")
   local header = ngx.var["http_" .. target_header]
   if header then
-    if traffic_shaping_policy.headerValue and #traffic_shaping_policy.headerValue > 0 then
+    if traffic_shaping_policy.headerValue
+	   and #traffic_shaping_policy.headerValue > 0 then
       if traffic_shaping_policy.headerValue == header then
         return true
+      end
+    elseif traffic_shaping_policy.headerPattern
+       and #traffic_shaping_policy.headerPattern > 0 then
+      local m, err = ngx.re.match(header, traffic_shaping_policy.headerPattern)
+      if m then
+        return true
+      elseif  err then
+          ngx.log(ngx.ERR, "error when matching canary-by-header-pattern: '",
+                  traffic_shaping_policy.headerPattern, "', error: ", err)
+          return false
       end
     elseif header == "always" then
       return true
@@ -190,6 +248,10 @@ local function route_to_alternative_balancer(balancer)
 end
 
 local function get_balancer()
+  if ngx.ctx.balancer then
+    return ngx.ctx.balancer
+  end
+
   local backend_name = ngx.var.proxy_upstream_name
 
   local balancer = balancers[backend_name]
@@ -198,18 +260,30 @@ local function get_balancer()
   end
 
   if route_to_alternative_balancer(balancer) then
-    local alternative_balancer = balancers[balancer.alternative_backends[1]]
-    return alternative_balancer
+    local alternative_backend_name = balancer.alternative_backends[1]
+    ngx.var.proxy_alternative_upstream_name = alternative_backend_name
+
+    balancer = balancers[alternative_backend_name]
   end
+
+  ngx.ctx.balancer = balancer
 
   return balancer
 end
 
 function _M.init_worker()
-  sync_backends() -- when worker starts, sync backends without delay
-  local _, err = ngx.timer.every(BACKENDS_SYNC_INTERVAL, sync_backends)
-  if err then
-    ngx.log(ngx.ERR, string.format("error when setting up timer.every for sync_backends: %s", tostring(err)))
+  -- when worker starts, sync backends without delay
+  -- we call it in timer because for endpoints that require
+  -- DNS resolution it needs to use socket which is not available in
+  -- init_worker phase
+  local ok, err = ngx.timer.at(0, sync_backends)
+  if not ok then
+    ngx.log(ngx.ERR, "failed to create timer: ", err)
+  end
+
+  ok, err = ngx.timer.every(BACKENDS_SYNC_INTERVAL, sync_backends)
+  if not ok then
+    ngx.log(ngx.ERR, "error when setting up timer.every for sync_backends: ", err)
   end
 end
 
@@ -237,7 +311,8 @@ function _M.balance()
 
   local ok, err = ngx_balancer.set_current_peer(peer)
   if not ok then
-    ngx.log(ngx.ERR, string.format("error while setting current upstream peer %s: %s", peer, err))
+    ngx.log(ngx.ERR, "error while setting current upstream peer ", peer,
+            ": ", err)
   end
 end
 
@@ -254,9 +329,11 @@ function _M.log()
   balancer:after_balance()
 end
 
-if _TEST then
-  _M.get_implementation = get_implementation
-  _M.sync_backend = sync_backend
-end
+setmetatable(_M, {__index = {
+  get_implementation = get_implementation,
+  sync_backend = sync_backend,
+  route_to_alternative_balancer = route_to_alternative_balancer,
+  get_balancer = get_balancer,
+}})
 
 return _M

@@ -1,17 +1,22 @@
-IMAGE=nginx-ingress-controller:e2e
 
-.PHONY: all container getbins clean
+DIR:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 
-all: container
+image:
+	make -C $(DIR)/../../ e2e-test-binary
 
-container:
-	make -C ../../ e2e-test-binary
+	cp $(DIR)/../e2e/e2e.test .
+	cp $(DIR)/../e2e/wait-for-nginx.sh .
+	cp -R $(DIR)/../../charts .
 
-	cp ../e2e/e2e.test .
-	cp ../e2e/wait-for-nginx.sh .
+	# TODO: avoid manual copy
+	cp -R $(DIR)/../../test/e2e/settings/ocsp/* .
 
-	docker build -t $(IMAGE) .
+	docker build \
+		--tag nginx-ingress-controller:e2e .
 
 clean:
 	rm -rf _cache e2e.test kubectl cluster ginkgo
-	docker rmi -f $(IMAGE) || true
+	docker rmi -f nginx-ingress-controller:e2e || true
+
+
+.PHONY: image clean

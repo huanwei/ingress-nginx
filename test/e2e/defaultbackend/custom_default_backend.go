@@ -17,45 +17,43 @@ limitations under the License.
 package defaultbackend
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
-
-	"github.com/parnurzeal/gorequest"
-
-	appsv1beta1 "k8s.io/api/apps/v1beta1"
+	"github.com/onsi/ginkgo"
+	"github.com/stretchr/testify/assert"
+	appsv1 "k8s.io/api/apps/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"k8s.io/ingress-nginx/test/e2e/framework"
 )
 
-var _ = framework.IngressNginxDescribe("Custom Default Backend", func() {
+var _ = framework.IngressNginxDescribe("[Default Backend] custom service", func() {
 	f := framework.NewDefaultFramework("custom-default-backend")
 
-	BeforeEach(func() {
-		f.NewEchoDeploymentWithReplicas(1)
+	ginkgo.It("uses custom default backend that returns 200 as status code", func() {
+		f.NewEchoDeployment()
 
-		framework.UpdateDeployment(f.KubeClientSet, f.Namespace, "nginx-ingress-controller", 1,
-			func(deployment *appsv1beta1.Deployment) error {
+		err := framework.UpdateDeployment(f.KubeClientSet, f.Namespace, "nginx-ingress-controller", 1,
+			func(deployment *appsv1.Deployment) error {
 				args := deployment.Spec.Template.Spec.Containers[0].Args
-				args = append(args, fmt.Sprintf("--default-backend-service=%s/%s", f.Namespace, "http-svc"))
+				args = append(args, fmt.Sprintf("--default-backend-service=%v/%v", f.Namespace, framework.EchoService))
 				deployment.Spec.Template.Spec.Containers[0].Args = args
-				_, err := f.KubeClientSet.AppsV1beta1().Deployments(f.Namespace).Update(deployment)
-
+				_, err := f.KubeClientSet.AppsV1().Deployments(f.Namespace).Update(context.TODO(), deployment, metav1.UpdateOptions{})
 				return err
 			})
+		assert.Nil(ginkgo.GinkgoT(), err, "updating deployment")
 
 		f.WaitForNginxServer("_",
 			func(server string) bool {
-				return strings.Contains(server, "set $proxy_upstream_name \"upstream-default-backend\"")
+				return strings.Contains(server, `set $proxy_upstream_name "upstream-default-backend"`)
 			})
-	})
 
-	It("uses custom default backend", func() {
-		resp, _, errs := gorequest.New().Get(f.GetURL(framework.HTTP)).End()
-		Expect(errs).Should(BeEmpty())
-		Expect(resp.StatusCode).Should(Equal(http.StatusOK))
+		f.HTTPTestClient().
+			GET("/").
+			Expect().
+			Status(http.StatusOK)
 	})
 })

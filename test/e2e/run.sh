@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright 2017 The Kubernetes Authors.
+# Copyright 2019 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,42 +14,91 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-set -e
+KIND_LOG_LEVEL="1"
+
+if ! [ -z $DEBUG ]; then
+  set -x
+  KIND_LOG_LEVEL="6"
+fi
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+cleanup() {
+  if [[ "${KUBETEST_IN_DOCKER:-}" == "true" ]]; then
+    kind "export" logs --name ${KIND_CLUSTER_NAME} "${ARTIFACTS}/logs" || true
+  fi
+
+  kind delete cluster \
+    --verbosity=${KIND_LOG_LEVEL} \
+    --name ${KIND_CLUSTER_NAME}
+}
+
+trap cleanup EXIT
+
+export KIND_CLUSTER_NAME=${KIND_CLUSTER_NAME:-ingress-nginx-dev}
+
+# Disable execution if running as a Prow job
+#if [[ ! -z ${PROW_JOB_ID:-} ]]; then
+#  echo "skipping execution..."
+#  exit 0
+#fi
+
+if ! command -v kind --version &> /dev/null; then
+  echo "kind is not installed. Use the package manager or visit the official site https://kind.sigs.k8s.io/"
+  exit 1
+fi
 
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
-export TAG=dev
-export ARCH=amd64
-export REGISTRY=${REGISTRY:-ingress-controller}
+# Use 1.0.0-dev to make sure we use the latest configuration in the helm template
+export TAG=1.0.0-dev
+export ARCH=${ARCH:-amd64}
+export REGISTRY=ingress-controller
 
-KIND_CLUSTER_NAME="ingress-nginx-dev"
+export DOCKER_CLI_EXPERIMENTAL=enabled
 
-kind --version || $(echo "Please install kind before running e2e tests";exit 1)
+export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/kind-config-$KIND_CLUSTER_NAME}"
 
-SKIP_CLUSTER_CREATION=${SKIP_CLUSTER_CREATION:-}
-if [ -z "${SKIP_CLUSTER_CREATION}" ]; then
-    echo "[dev-env] creating Kubernetes cluster with kind"
-    kind create cluster --name ${KIND_CLUSTER_NAME} --config ${DIR}/kind.yaml
+if [ "${SKIP_CLUSTER_CREATION:-false}" = "false" ]; then
+  echo "[dev-env] creating Kubernetes cluster with kind"
+
+  export K8S_VERSION=${K8S_VERSION:-v1.18.4@sha256:d8ff5fc405fc679dd3dd0cccc01543ba4942ed90823817d2e9e2c474a5343c4f}
+
+  kind create cluster \
+    --verbosity=${KIND_LOG_LEVEL} \
+    --name ${KIND_CLUSTER_NAME} \
+    --config ${DIR}/kind.yaml \
+    --retain \
+    --image "kindest/node:${K8S_VERSION}"
+
+  echo "Kubernetes cluster:"
+  kubectl get nodes -o wide
 fi
 
-export KUBECONFIG="$(kind get kubeconfig-path --name="${KIND_CLUSTER_NAME}")"
+if [ "${SKIP_IMAGE_CREATION:-false}" = "false" ]; then
+  if ! command -v ginkgo &> /dev/null; then
+    go get github.com/onsi/ginkgo/ginkgo
+  fi
 
-sleep 60
+  echo "[dev-env] building image"
+  make -C ${DIR}/../../ clean-image build image
+  make -C ${DIR}/../e2e-image image
+fi
 
-echo "Kubernetes cluster:"
-kubectl get nodes -o wide
+#make -C ${DIR}/../../images/fastcgi-helloserver/ build image
+#make -C ${DIR}/../../images/echo/ image
 
-echo "[dev-env] installing kubectl"
-kubectl version || $(echo "Please install kubectl before running e2e tests";exit 1)
+# Preload images used in e2e tests
+KIND_WORKERS=$(kind get nodes --name="${KIND_CLUSTER_NAME}" | grep worker | awk '{printf (NR>1?",":"") $1}')
 
-kubectl config set-context kubernetes-admin@${KIND_CLUSTER_NAME}
+echo "[dev-env] copying docker images to cluster..."
 
-echo "[dev-env] building container"
-make -C ${DIR}/../../ build container
-make -C ${DIR}/../../ e2e-test-image
+kind load docker-image --name="${KIND_CLUSTER_NAME}" --nodes=${KIND_WORKERS} nginx-ingress-controller:e2e
+kind load docker-image --name="${KIND_CLUSTER_NAME}" --nodes=${KIND_WORKERS} ${REGISTRY}/controller:${TAG}
+#kind load docker-image --name="${KIND_CLUSTER_NAME}" --nodes=${KIND_WORKERS} ${REGISTRY}/fastcgi-helloserver:${TAG}
+#kind load docker-image --name="${KIND_CLUSTER_NAME}" --nodes=${KIND_WORKERS} ${REGISTRY}/echo:${TAG}
 
-echo "copying docker images to cluster..."
-kind load docker-image --name="${KIND_CLUSTER_NAME}" ${REGISTRY}/nginx-ingress-controller:${TAG}
-kind load docker-image --name="${KIND_CLUSTER_NAME}" nginx-ingress-controller:e2e
-
+echo "[dev-env] running e2e tests..."
 make -C ${DIR}/../../ e2e-test
